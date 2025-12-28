@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 1
+names: ['Cricket-Ball']
+
+roboflow:
+  workspace: puranjay45
+  project: cricket-ball-detection-8uv1o-zajnc
+  version: 1
+  license: Public Domain
+  url: https://universe.roboflow.com/puranjay45/cricket-ball-detection-8uv1o-zajnc/dataset/1
