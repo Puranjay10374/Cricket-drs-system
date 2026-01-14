@@ -261,7 +261,20 @@ class AdaptiveBallDetector(BallDetector):
         # 4. Histogram back-projection
         hist_results = self._detect_by_histogram(frame)
         candidates.extend(hist_results)
-        multi_template(self, frame: np.ndarray) -> List[Tuple]:
+        
+        # === Fuse all candidates ===
+        result = self._fuse_candidates(candidates, frame)
+        
+        # Update appearance model if detection successful
+        if result:
+            self._update_appearance_model(frame, result)
+            self.detection_confidence = 0.8
+        else:
+            self.detection_confidence = 0.0
+        
+        return result
+    
+    def _detect_by_multi_template(self, frame: np.ndarray) -> List[Tuple]:
         """Multi-scale, multi-rotation template matching"""
         candidates = []
         
@@ -315,7 +328,44 @@ class AdaptiveBallDetector(BallDetector):
             mask = cv2.inRange(converted, model['lower'], model['upper'])
             
             # Morphological operations
-         fuse_candidates(self, candidates: List[Tuple], frame: np.ndarray) -> Optional[Tuple]:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            
+            # Find contours
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if area < 15:
+                    continue
+                
+                (x, y), radius = cv2.minEnclosingCircle(contour)
+                
+                if not (self.min_radius <= radius <= self.max_radius):
+                    continue
+                
+                # Calculate shape metrics
+                perimeter = cv2.arcLength(contour, True)
+                if perimeter == 0:
+                    continue
+                
+                circularity = 4 * np.pi * area / (perimeter ** 2)
+                compactness = area / (np.pi * radius ** 2)
+                
+                # Size match score
+                size_score = 1.0 - abs(radius - self.expected_radius) / self.expected_radius
+                size_score = max(0, min(1, size_score))
+                
+                # Combined score
+                confidence = (circularity * 0.4 + compactness * 0.3 + size_score * 0.3) * 0.8
+                
+                if confidence > 0.3:
+                    candidates.append((int(x), int(y), int(radius), confidence, f'color_{model["space"]}'))
+        
+        return candidates
+    
+    def _fuse_candidates(self, candidates: List[Tuple], frame: np.ndarray) -> Optional[Tuple]:
         """
         Intelligent fusion of detection candidates using:
         - Spatial clustering
@@ -338,63 +388,57 @@ class AdaptiveBallDetector(BallDetector):
         
         if not scored_clusters:
             return None
-        fallback detection"""
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         
-        # Try multiple color ranges
-        ranges = [
-            (np.array([145, 50, 50]), np.array([165, 255, 255])),  # Pink
-            (np.array([0, 100, 100]), np.array([10, 255, 255])),   # Red
-            (np.array([0, 0, 200]), np.array([180, 30, 255])),     # White
-        ]
+        # Return best cluster
+        best_cluster, best_score = max(scored_clusters, key=lambda x: x[1])
         
-        all_contours = []
-        for lower, upper in ranges:
-            mask = cv2.inRange(hsv, lower, upper)
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            all_contours.extend(contours)
-        
-        if not all_contours:
+        # Calculate weighted centroid
+        total_weight = sum(c[3] for c in best_cluster)
+        if total_weight == 0:
             return None
         
-        # Get largest reasonable contour
-        valid_contours = [c for c in all_contours if 20 < cv2.contourArea(c) < 2000]
-        if not valid_contours:
-            return None
+        x = int(sum(c[0] * c[3] for c in best_cluster) / total_weight)
+        y = int(sum(c[1] * c[3] for c in best_cluster) / total_weight)
+        radius = int(sum(c[2] * c[3] for c in best_cluster) / total_weight)
         
-        larDetermine ball color from HSV"""
-        if (h <= 10 or h >= 170) and s > 100:
-            self.last_detected_color = "red"
-        elif 145 <= h <= 165 and s > 50:
-            self.last_detected_color = "pink"
-        elif s < 50 and v > 150:
-            self.last_detected_color = "white"
-        elif 20 <= h <= 35 and s > 100:
-            self.last_detected_color = "yellow"
-        else:
-            self.last_detected_color = "custom"
+        self.detection_confidence = best_score
+        return (x, y, radius)
     
-    def get_last_detected_color(self) -> Optional[str]:
-        """Get detected ball color"""
-        return self.last_detected_color
+    def _cluster_candidates(self, candidates: List[Tuple]) -> List[List[Tuple]]:
+        """Cluster nearby candidates using spatial proximity"""
+        if not candidates:
+            return []
+        
+        clusters = []
+        used = set()
+        
+        for i, cand in enumerate(candidates):
+            if i in used:
+                continue
+            
+            cluster = [cand]
+            used.add(i)
+            
+            for j, other in enumerate(candidates):
+                if j in used:
+                    continue
+                
+                dist = np.sqrt((cand[0] - other[0])**2 + (cand[1] - other[1])**2)
+                if dist < 30:  # Cluster radius
+                    cluster.append(other)
+                    used.add(j)
+            
+            clusters.append(cluster)
+        
+        return clusters
     
-    def get_detection_confidence(self) -> float:
-        """Get confidence of last detection (0-1)"""
-        return self.detection_confidence
-    
-    def reset(self):
-        """Reset detector state for new video"""
-        self.frame_count = 0
-        self.position_history.clear()
-        self.velocity_history.clear()
-        self.appearance_history.clear()
-        self.predicted_position = None
-        self.prev_gray = None
-        self.background_subtractor = cv2.createBackgroundSubtractorMOG2(
-            history=500, varThreshold=16, detectShadows=True
-        )] for c in cluster])
+    def _score_cluster(self, cluster: List[Tuple], frame: np.ndarray) -> float:
+        """Score a cluster of detections"""
+        if not cluster:
+            return 0.0
+        
+        # Average confidence score
+        confidence_score = np.mean([c[3] for c in cluster])
         
         # Bonus for multiple detection methods agreeing
         methods = set([c[4] for c in cluster])
@@ -416,6 +460,26 @@ class AdaptiveBallDetector(BallDetector):
         
         total_score = confidence_score + diversity_bonus + size_bonus + motion_bonus
         return min(1.0, total_score)
+    
+    def get_last_detected_color(self) -> Optional[str]:
+        """Get detected ball color"""
+        return self.last_detected_color
+    
+    def get_detection_confidence(self) -> float:
+        """Get confidence of last detection (0-1)"""
+        return self.detection_confidence
+    
+    def reset(self):
+        """Reset detector state for new video"""
+        self.frame_count = 0
+        self.position_history.clear()
+        self.velocity_history.clear()
+        self.appearance_history.clear()
+        self.predicted_position = None
+        self.prev_gray = None
+        self.background_subtractor = cv2.createBackgroundSubtractorMOG2(
+            history=500, varThreshold=16, detectShadows=True
+        )
     
     def _update_motion_model(self, detection: Tuple[int, int, int]):
         """Update motion prediction"""
@@ -488,23 +552,7 @@ class AdaptiveBallDetector(BallDetector):
                 pass  # Implement incremental update if needed
         
         # Update expected radius
-        self.expected_radius = int(self.expected_radius * 0.9 + radius * 0.1)perimeter == 0:
-                    continue
-                
-                circularity = 4 * np.pi * area / (perimeter ** 2)
-                compactness = area / (np.pi * radius ** 2)
-                
-                # Size match score
-                size_score = 1.0 - abs(radius - self.expected_radius) / self.expected_radius
-                size_score = max(0, min(1, size_score))
-                
-                # Combined score
-                confidence = (circularity * 0.4 + compactness * 0.3 + size_score * 0.3) * 0.8
-                
-                if confidence > 0.3:
-                    candidates.append((int(x), int(y), int(radius), confidence, f'color_{model["space"]}'))
-        
-        return candidates
+        self.expected_radius = int(self.expected_radius * 0.9 + radius * 0.1)
     
     def _detect_by_background_subtraction(self, frame: np.ndarray) -> List[Tuple]:
         """Detect moving objects (ball should be moving)"""
@@ -639,51 +687,7 @@ class AdaptiveBallDetector(BallDetector):
         
         confidence = min(1.0, len(matches) / 20.0) * 0.75
         
-        return [(int(center[0]), int(center[1]), self.expected_radius, confidence, 'features')r)
-            
-            if radius < 2 or radius > 30:
-                continue
-            
-            # Calculate circularity
-            perimeter = cv2.arcLength(contour, True)
-            if perimeter == 0:
-                continue
-            circularity = 4 * np.pi * area / (perimeter ** 2)
-            
-            # Score based on size and circularity
-            size_score = 1 - abs(radius - 10) / 20  # Prefer ~10px radius
-            score = circularity * 0.7 + size_score * 0.3
-            
-            if score > 0.3:
-                candidates.append((int(x), int(y), int(radius), score))
-        
-        # Sort by score (best first)
-        candidates.sort(key=lambda c: c[3], reverse=True)
-        
-        # Return top 3 candidates without score
-        return [(x, y, r) for x, y, r, s in candidates[:3]]
-    
-    def _detect_by_template(self, frame: np.ndarray) -> Optional[Tuple[int, int, int]]:
-        """Detect using template matching"""
-        if self.ball_template is None:
-            return None
-        
-        # Convert to grayscale for template matching
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        template_gray = cv2.cvtColor(self.ball_template, cv2.COLOR_BGR2GRAY)
-        
-        # Match template
-        result = cv2.matchTemplate(gray, template_gray, cv2.TM_CCOEFF_NORMED)
-        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
-        
-        # Only accept good matches
-        if max_val > 0.6:  # Confidence threshold
-            x = max_loc[0] + self.template_size[0] // 2
-            y = max_loc[1] + self.template_size[1] // 2
-            radius = self.template_size[0] // 2
-            return (x, y, radius)
-        
-        return None
+        return [(int(center[0]), int(center[1]), self.expected_radius, confidence, 'features')]
     
     def _detect_basic(self, frame: np.ndarray) -> Optional[Tuple[int, int, int]]:
         """Basic detection without learning (fallback)"""
